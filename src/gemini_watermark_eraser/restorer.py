@@ -62,10 +62,39 @@ class TemporalLogoRestorer:
         ]
         self.hard_mask = (self.soft_mask > 0.025).astype(np.uint8) * 255
         self._flow_mask = (self.hard_mask > 0).astype(np.uint8)
-        self._mask_y, self._mask_x = np.nonzero(self.hard_mask)
+        # The detector already supplies a deliberately widened, anti-aliased
+        # logo support. Keep that smooth profile for the sole final composite;
+        # a binary hard edge creates the very outline this repair must avoid.
+        feather_radius = 2
+        fill_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (feather_radius * 2 + 1, feather_radius * 2 + 1),
+        )
+        self._fill_mask = cv2.dilate(self.hard_mask, fill_kernel)
+        outside_distance = cv2.distanceTransform(
+            (self.hard_mask == 0).astype(np.uint8),
+            cv2.DIST_L2,
+            5,
+        )
+        feather_progress = np.clip(outside_distance / float(feather_radius), 0.0, 1.0)
+        feather_progress = feather_progress * feather_progress * (3.0 - 2.0 * feather_progress)
+        outside_feather = 1.0 - feather_progress
+        self._composite_alpha = np.where(self.hard_mask > 0, 1.0, outside_feather).astype(np.float32)
+        self._composite_alpha[self._fill_mask == 0] = 0.0
+        inside_distance = cv2.distanceTransform(
+            (self.hard_mask > 0).astype(np.uint8),
+            cv2.DIST_L2,
+            5,
+        )
+        self._temporal_transition = np.clip(inside_distance / 3.0, 0.0, 1.0)
+        self._detail_taper = np.clip((inside_distance - 1.0) / 2.0, 0.0, 1.0)
+        self._fill_y, self._fill_x = np.nonzero(self._fill_mask)
         self._grid_y, self._grid_x = np.mgrid[:roi_height, :roi_width].astype(np.float32)
         self._flow = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
         self.last_temporal_coverage = 0.0
+        self._exemplar_locked_offset: tuple[int, int] | None = None
+        self._exemplar_locked_structured: bool | None = None
+        self._exemplar_locked_cohort: tuple[tuple[int, int], ...] = ()
         mask_y, mask_x = np.nonzero(self.hard_mask)
         exemplar_pad = max(5, int(round(min(width, height) * 0.12)))
         self._template_x0 = max(0, int(mask_x.min()) - exemplar_pad)
@@ -76,10 +105,15 @@ class TemporalLogoRestorer:
             self._template_y0 : self._template_y1,
             self._template_x0 : self._template_x1,
         ]
+        local_fill = self._fill_mask[
+            self._template_y0 : self._template_y1,
+            self._template_x0 : self._template_x1,
+        ]
         ring_width = max(7, int(round(min(width, height) * 0.20)))
         if ring_width % 2 == 0:
             ring_width += 1
         self._exemplar_local_hard = local_hard
+        self._exemplar_local_fill = local_fill
         self._exemplar_ring = cv2.dilate(local_hard, np.ones((ring_width, ring_width), np.uint8)) - local_hard
 
     @property
@@ -152,32 +186,60 @@ class TemporalLogoRestorer:
             if exemplar is not None:
                 return exemplar
         radius = max(3, int(round(min(self.detection.width, self.detection.height) * 0.09)))
-        first = cv2.inpaint(current, self.hard_mask, radius, cv2.INPAINT_TELEA)
-        # A second pass at half scale reduces directional streaks on detailed textures.
-        half_size = (max(1, current.shape[1] // 2), max(1, current.shape[0] // 2))
-        small = cv2.resize(first, half_size, interpolation=cv2.INTER_AREA)
-        small_mask = cv2.resize(self.hard_mask, half_size, interpolation=cv2.INTER_NEAREST)
-        small = cv2.inpaint(small, small_mask, max(2, radius // 2), cv2.INPAINT_TELEA)
-        smooth = cv2.resize(small, (current.shape[1], current.shape[0]), interpolation=cv2.INTER_CUBIC)
-        inner = cv2.erode(self.hard_mask, np.ones((5, 5), np.uint8)).astype(np.float32) / 255.0
-        inner = cv2.GaussianBlur(inner, (0, 0), sigmaX=1.2)[..., None]
-        return np.clip(first * (1.0 - inner) + smooth * inner, 0, 255).astype(np.uint8)
+        return cv2.inpaint(current, self._fill_mask, radius, cv2.INPAINT_TELEA)
 
-    def _restore_visible_detail(self, current: np.ndarray, restored: np.ndarray) -> np.ndarray:
-        """Keep fine source texture that remains visible beneath the translucent mark."""
-        interior = cv2.erode(self.hard_mask, np.ones((5, 5), np.uint8))
-        if not np.any(interior):
-            return restored
-        source = current.astype(np.float32)
-        low_frequency = cv2.GaussianBlur(source, (0, 0), sigmaX=1.15)
-        detail = np.clip(source - low_frequency, -24.0, 24.0)
-        repaired_low = cv2.GaussianBlur(restored.astype(np.float32), (0, 0), sigmaX=0.85)
-        repaired_detail = np.clip(restored.astype(np.float32) - repaired_low, -18.0, 18.0)
-        alpha = cv2.GaussianBlur(interior.astype(np.float32) / 255.0, (0, 0), sigmaX=1.0)
-        alpha = (alpha * 0.72)[..., None]
-        return np.clip(restored.astype(np.float32) + detail * alpha + repaired_detail * alpha * 0.70, 0, 255).astype(
-            np.uint8
-        )
+    def _composite_repair(self, current: np.ndarray, replacement: np.ndarray) -> np.ndarray:
+        """Composite source and clean replacement exactly once."""
+        alpha = self._composite_alpha[..., None]
+        return np.clip(
+            current.astype(np.float32) * (1.0 - alpha) + replacement.astype(np.float32) * alpha,
+            0,
+            255,
+        ).astype(np.uint8)
+
+    @staticmethod
+    def _gradient_structure(image: np.ndarray, mask: np.ndarray) -> tuple[float, float]:
+        """Return structure-tensor orientation coherence and dominant angle."""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        horizontal = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        vertical = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        selected = mask > 0
+        if int(np.sum(selected)) < 16:
+            return 0.0, 0.0
+        xx = float(np.sum(horizontal[selected] ** 2))
+        yy = float(np.sum(vertical[selected] ** 2))
+        xy = float(np.sum(horizontal[selected] * vertical[selected]))
+        energy = xx + yy
+        if energy <= 1e-6:
+            return 0.0, 0.0
+        coherence = float(np.hypot(xx - yy, 2.0 * xy) / energy)
+        angle = float(0.5 * np.arctan2(2.0 * xy, xx - yy))
+        return coherence, angle
+
+    @staticmethod
+    def _match_ring_color(
+        source: np.ndarray,
+        target: np.ndarray,
+        ring: np.ndarray,
+    ) -> np.ndarray:
+        """Match clean source low-frequency colour to the clean target ring."""
+        selected = ring > 0
+        source_values = source[selected].astype(np.float32)
+        target_values = target[selected].astype(np.float32)
+        if len(source_values) < 16:
+            return source
+
+        source_low, source_high = np.percentile(source_values, (20, 80), axis=0)
+        target_low, target_high = np.percentile(target_values, (20, 80), axis=0)
+        source_span = source_high - source_low
+        target_span = target_high - target_low
+        gain = np.ones(3, dtype=np.float32)
+        stable = source_span >= 6.0
+        gain[stable] = np.clip(target_span[stable] / source_span[stable], 0.85, 1.15)
+        source_median = np.median(source_values, axis=0)
+        target_median = np.median(target_values, axis=0)
+        bias = np.clip(target_median - source_median * gain, -24.0, 24.0).astype(np.float32)
+        return np.clip(source.astype(np.float32) * gain + bias, 0.0, 255.0)
 
     def _exemplar_fill(self, current: np.ndarray) -> np.ndarray | None:
         template = current[
@@ -193,24 +255,26 @@ class TemporalLogoRestorer:
             mask=self._exemplar_ring,
         )
         finite = np.nan_to_num(scores, nan=np.inf, posinf=np.inf, neginf=np.inf)
+        overlap = cv2.matchTemplate(
+            (self.hard_mask > 0).astype(np.float32),
+            (self._exemplar_local_fill > 0).astype(np.float32),
+            cv2.TM_CCORR,
+        )
+        finite[overlap > 0.5] = np.inf
         flat = finite.ravel()
-        candidate_count = min(160, flat.size)
+        valid_indices = np.flatnonzero(np.isfinite(flat))
+        candidate_count = min(160, len(valid_indices))
         if candidate_count == 0:
             return None
-        indices = np.argpartition(flat, candidate_count - 1)[:candidate_count]
+        selected_valid = np.argpartition(flat[valid_indices], candidate_count - 1)[:candidate_count]
+        indices = valid_indices[selected_valid]
 
         ranked_candidates: list[tuple[float, float, int, int]] = []
         target_x, target_y = self._template_x0, self._template_y0
-        logo_pixels = self._exemplar_local_hard > 0
+        fill_pixels = self._exemplar_local_fill > 0
         scale = max(1.0, float(self.detection.width))
         for index in indices:
             source_y, source_x = np.unravel_index(int(index), scores.shape)
-            source_mask = self.hard_mask[
-                source_y : source_y + template.shape[0],
-                source_x : source_x + template.shape[1],
-            ]
-            if source_mask.shape != self._exemplar_local_hard.shape or np.any(source_mask[logo_pixels]):
-                continue
             raw_score = float(finite[source_y, source_x])
             distance = np.hypot(source_x - target_x, source_y - target_y) / scale
             ranked_score = raw_score + 0.025 * distance
@@ -219,18 +283,138 @@ class TemporalLogoRestorer:
         if not ranked_candidates:
             return None
         ranked_candidates.sort(key=lambda item: item[0])
-        best_score, _, source_x, source_y = ranked_candidates[0]
-        if best_score > 0.36:
+        best = ranked_candidates[0]
+        best_score, best_raw_score, source_x, source_y = best
+        if best_raw_score > 0.36:
             return None
+
+        best_clean_patch = current[
+            source_y : source_y + template.shape[0],
+            source_x : source_x + template.shape[1],
+        ]
+        best_coherence, best_angle = self._gradient_structure(best_clean_patch, self._exemplar_local_fill)
+        proposed_structured = best_coherence >= 0.55
+
+        def candidate_at(offset: tuple[int, int]) -> tuple[float, float, int, int] | None:
+            candidate_x = target_x + offset[0]
+            candidate_y = target_y + offset[1]
+            if not (0 <= candidate_x < scores.shape[1] and 0 <= candidate_y < scores.shape[0]):
+                return None
+            raw_score = float(finite[candidate_y, candidate_x])
+            if not np.isfinite(raw_score) or raw_score > 0.36:
+                return None
+            distance = np.hypot(candidate_x - target_x, candidate_y - target_y) / scale
+            ranked_score = raw_score + 0.025 * distance
+            if ranked_score > 0.46:
+                return None
+            return ranked_score, raw_score, int(candidate_x), int(candidate_y)
+
+        def candidate_structure(item: tuple[float, float, int, int]) -> tuple[float, float]:
+            patch = current[
+                item[3] : item[3] + template.shape[0],
+                item[2] : item[2] + template.shape[1],
+            ]
+            return self._gradient_structure(patch, self._exemplar_local_fill)
+
+        previous_offset = self._exemplar_locked_offset
+        previous_structured = self._exemplar_locked_structured
+        locked = candidate_at(previous_offset) if previous_offset is not None else None
+        locked_coherence = 0.0
+        locked_angle = 0.0
+        locked_valid = locked is not None
+        if locked is not None:
+            locked_coherence, locked_angle = candidate_structure(locked)
+            if previous_structured and locked_coherence < 0.55:
+                locked_valid = False
+
+        keep_locked_anchor = bool(
+            locked_valid
+            and locked is not None
+            and best_score + 0.035 >= locked[0]
+        )
+        if keep_locked_anchor:
+            anchor = locked
+            structured_target = bool(previous_structured)
+            anchor_angle = locked_angle
+        else:
+            anchor = best
+            structured_target = proposed_structured
+            anchor_angle = best_angle
+
+        new_offset = (anchor[2] - target_x, anchor[3] - target_y)
+        anchor_switched = previous_offset is not None and new_offset != previous_offset
+        mode_switched = previous_structured is not None and structured_target != previous_structured
+        if anchor_switched or mode_switched:
+            self._exemplar_locked_cohort = ()
+        self._exemplar_locked_offset = new_offset
+        self._exemplar_locked_structured = structured_target
+
+        anchor_score, _, source_x, source_y = anchor
         cluster_radius = max(3.0, min(float(self.detection.width) * 0.12, 8.0))
-        selected = [
-            item
-            for item in ranked_candidates
-            if item[0] <= best_score + 0.045
-            and np.hypot(item[2] - source_x, item[3] - source_y) <= cluster_radius
-        ][:5]
+        selected = [anchor]
+        if structured_target:
+            normal_x = float(np.cos(anchor_angle))
+            normal_y = float(np.sin(anchor_angle))
+
+            def phase_valid(item: tuple[float, float, int, int]) -> bool:
+                if item[0] > anchor_score + 0.045:
+                    return False
+                dx = item[2] - source_x
+                dy = item[3] - source_y
+                if np.hypot(dx, dy) > cluster_radius:
+                    return False
+                coherence, angle = candidate_structure(item)
+                normal_offset = abs(dx * normal_x + dy * normal_y)
+                angle_alignment = abs(float(np.cos(angle - anchor_angle)))
+                return coherence >= 0.55 and normal_offset <= 0.45 and angle_alignment >= 0.985
+
+            locked_cohort: list[tuple[float, float, int, int]] = []
+            cohort_valid = len(self._exemplar_locked_cohort) >= 2
+            if cohort_valid:
+                for offset in self._exemplar_locked_cohort:
+                    item = candidate_at(offset)
+                    if item is None or not phase_valid(item):
+                        cohort_valid = False
+                        break
+                    locked_cohort.append(item)
+            if cohort_valid:
+                selected = locked_cohort
+            else:
+                selected = []
+                seen_positions: set[tuple[int, int]] = set()
+                for item in (anchor, *ranked_candidates):
+                    position = (item[2], item[3])
+                    if position in seen_positions:
+                        continue
+                    seen_positions.add(position)
+                    if phase_valid(item):
+                        selected.append(item)
+                    if len(selected) == 3:
+                        break
+                if len(selected) < 2:
+                    self._exemplar_locked_cohort = ()
+                    return None
+                cohort_offsets = tuple((item[2] - target_x, item[3] - target_y) for item in selected)
+                self._exemplar_locked_cohort = cohort_offsets
+        else:
+            self._exemplar_locked_cohort = ()
+            selected.extend(
+                item
+                for item in ranked_candidates
+                if (item[2], item[3]) != (source_x, source_y)
+                and item[0] <= anchor_score + 0.045
+                and np.hypot(item[2] - source_x, item[3] - source_y) <= cluster_radius
+            )
+            selected = selected[:5]
         if not selected:
-            selected = [ranked_candidates[0]]
+            selected = [anchor]
+        clean_color_ring = self._exemplar_ring > 0
+        for _, _, x, y in selected:
+            source_logo = self.hard_mask[
+                y : y + template.shape[0],
+                x : x + template.shape[1],
+            ] > 0
+            clean_color_ring &= ~source_logo
         patches = np.stack(
             [
                 current[y : y + template.shape[0], x : x + template.shape[1]].astype(np.float32)
@@ -245,27 +429,53 @@ class TemporalLogoRestorer:
         best_patch = patches[0]
         best_smooth = cv2.GaussianBlur(best_patch, (0, 0), sigmaX=0.75)
         detail = np.clip(best_patch - best_smooth, -10.0, 10.0)
-        source = np.clip(source + detail * 0.45, 0, 255)
+        detail_gain = 0.45 if structured_target else 0.25
+        source = np.clip(source + detail * detail_gain, 0, 255)
+        source = self._match_ring_color(
+            source,
+            template,
+            clean_color_ring.astype(np.uint8),
+        )
         result = current.copy()
         target = result[
             self._template_y0 : self._template_y1,
             self._template_x0 : self._template_x1,
         ]
-        alpha = cv2.GaussianBlur(
-            logo_pixels.astype(np.float32),
-            (0, 0),
-            sigmaX=max(0.8, self.detection.width * 0.018),
-        )[..., None]
-        target[:] = np.clip(target.astype(np.float32) * (1.0 - alpha) + source.astype(np.float32) * alpha, 0, 255)
+        # This is a clean candidate patch. Copy it through the complete fill
+        # support without mixing the logo-bearing current pixels back in; the
+        # sole source-to-repair blend happens later in restore().
+        target[fill_pixels] = np.clip(source[fill_pixels], 0, 255).astype(np.uint8)
         return result
+
+    def _finish_repair(
+        self,
+        current: np.ndarray,
+        fallback: np.ndarray,
+        temporal: np.ndarray,
+        temporal_confidence: np.ndarray,
+    ) -> np.ndarray:
+        """Blend clean temporal pixels over fallback, then composite once."""
+        temporal_weight = np.clip(temporal_confidence, 0.0, 1.0)
+        fallback_weight = 1.0 - temporal_weight
+        replacement = (
+            fallback.astype(np.float32) * fallback_weight[..., None]
+            + temporal.astype(np.float32) * temporal_weight[..., None]
+        )
+        return self._composite_repair(current, np.clip(replacement, 0, 255).astype(np.uint8))
 
     def _fuse(self, current: np.ndarray, candidates: list[_WarpedCandidate]) -> np.ndarray:
         if not candidates:
             self.last_temporal_coverage = 0.0
-            return self._restore_visible_detail(current, self._fallback(current))
+            fallback = self._fallback(current)
+            return self._finish_repair(
+                current,
+                fallback,
+                fallback,
+                np.zeros(self.roi_shape, dtype=np.float32),
+            )
 
-        values = np.stack([candidate.pixels[self._mask_y, self._mask_x] for candidate in candidates], axis=0)
-        valid = np.stack([candidate.valid[self._mask_y, self._mask_x] for candidate in candidates], axis=0)
+        values = np.stack([candidate.pixels[self._fill_y, self._fill_x] for candidate in candidates], axis=0)
+        valid = np.stack([candidate.valid[self._fill_y, self._fill_x] for candidate in candidates], axis=0)
         weights = np.asarray([candidate.weight for candidate in candidates], dtype=np.float32)[:, None]
         masked_values = np.where(valid[..., None], values, np.nan)
         with warnings.catch_warnings():
@@ -277,8 +487,8 @@ class TemporalLogoRestorer:
         support = robust.sum(axis=0)
         weight_sum = effective_weights.sum(axis=0)
         accepted = (weight_sum > 0.09) & (support >= 2)
-        self.last_temporal_coverage = float(np.mean(accepted))
-        fallback = self._fallback(current, allow_exemplar=self.last_temporal_coverage < 0.28)
+        core = self.hard_mask[self._fill_y, self._fill_x] > 0
+        self.last_temporal_coverage = float(np.mean(accepted[core])) if np.any(core) else 0.0
         fused = np.sum(values * effective_weights[..., None], axis=0) / np.maximum(
             weight_sum[..., None],
             1e-6,
@@ -298,13 +508,31 @@ class TemporalLogoRestorer:
                 for candidate in candidates
             ],
             axis=0,
-        )[:, self._mask_y, self._mask_x]
+        )[:, self._fill_y, self._fill_x]
         detail = np.clip(candidate_details[best_index, pixel_index], -10.0, 10.0)
         detail_strength = np.clip((support.astype(np.float32) - 1.0) / 3.0, 0.0, 1.0)[..., None]
-        fused = np.clip(fused + detail * detail_strength * 0.70, 0, 255)
-        result = fallback.astype(np.float32)
-        result[self._mask_y[accepted], self._mask_x[accepted]] = fused[accepted]
-        return self._restore_visible_detail(current, np.clip(result, 0, 255).astype(np.uint8))
+        detail_taper = self._detail_taper[self._fill_y, self._fill_x][..., None]
+        fused = np.clip(fused + detail * detail_strength * detail_taper * 0.55, 0, 255)
+        fallback = self._fallback(current, allow_exemplar=self.last_temporal_coverage < 0.28)
+        # Confidence changes smoothly across temporal support boundaries. The
+        # clean temporal estimate is blended only with another clean fill, so
+        # low confidence can never reveal pixels from the marked current frame.
+        confidence = np.clip(weight_sum / 0.28, 0.0, 1.0)
+        confidence[~accepted] = 0.0
+        raw_confidence_map = np.zeros(self.roi_shape, dtype=np.float32)
+        raw_confidence_map[self._fill_y, self._fill_x] = confidence
+        confidence_map = cv2.GaussianBlur(raw_confidence_map, (0, 0), sigmaX=0.85)
+        accepted_map = np.zeros(self.roi_shape, dtype=np.uint8)
+        accepted_map[self._fill_y[accepted], self._fill_x[accepted]] = 255
+        accepted_interior = cv2.erode(accepted_map, np.ones((3, 3), np.uint8)) > 0
+        confidence_map = np.maximum(confidence_map, raw_confidence_map * accepted_interior)
+        confidence_map *= self._temporal_transition
+        confidence_map[self._fill_mask == 0] = 0.0
+        confidence_map = np.clip(confidence_map, 0.0, 1.0)
+
+        temporal = fallback.astype(np.float32)
+        temporal[self._fill_y[accepted], self._fill_x[accepted]] = fused[accepted]
+        return self._finish_repair(current, fallback, temporal, confidence_map)
 
     def restore(
         self,
@@ -347,8 +575,6 @@ class TemporalLogoRestorer:
                     candidates.append(warped)
 
         restored = self._fuse(current, candidates)
-        alpha = self.soft_mask[..., None]
-        blended = np.clip(current.astype(np.float32) * (1.0 - alpha) + restored.astype(np.float32) * alpha, 0, 255)
         output = prepared.frame.copy()
-        output[self.roi_y0 : self.roi_y1, self.roi_x0 : self.roi_x1] = blended.astype(np.uint8)
+        output[self.roi_y0 : self.roi_y1, self.roi_x0 : self.roi_x1] = restored
         return output

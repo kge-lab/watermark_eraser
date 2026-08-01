@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gemini-watermark-eraser"
-version = "0.1.0"
+version = "0.1.1"
 description = "Offline desktop utility that removes the visible Gemini watermark from generated videos."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"

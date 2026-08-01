@@ -13,6 +13,145 @@ if [[ -z "$app_path" ]]; then
   exit 1
 fi
 
+project_notice_files=(
+  "$project_root/LICENSE"
+  "$project_root/THIRD_PARTY_NOTICES.md"
+)
+for notice_file in "${project_notice_files[@]}"; do
+  if [[ ! -f "$notice_file" ]]; then
+    echo "Required project notice file is missing: $notice_file" >&2
+    exit 1
+  fi
+done
+
+site_packages="$(uv run python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+if [[ ! -d "$site_packages" ]]; then
+  echo "Installed Python site-packages directory does not exist: $site_packages" >&2
+  exit 1
+fi
+
+resolved_app_path="$(cd "$app_path" && pwd -P)"
+contents_directory="$app_path/Contents"
+if [[ ! -d "$contents_directory" ]]; then
+  echo "macOS application bundle has no Contents directory: $contents_directory" >&2
+  exit 1
+fi
+resolved_contents_directory="$(cd "$contents_directory" && pwd -P)"
+if [[ "$resolved_contents_directory" != "$resolved_app_path/Contents" ]]; then
+  echo "Refusing to create a licenses directory through a symbolic link outside the application bundle." >&2
+  exit 1
+fi
+resources_candidate="$contents_directory/Resources"
+if [[ -L "$resources_candidate" ]]; then
+  echo "Refusing to create a licenses directory through a symbolic link: $resources_candidate" >&2
+  exit 1
+fi
+mkdir -p "$resources_candidate"
+resources_directory="$(cd "$resources_candidate" && pwd -P)"
+if [[ "$resources_directory" != "$resolved_app_path/Contents/Resources" ]]; then
+  echo "Refusing to replace a licenses directory through a symbolic link outside the application bundle." >&2
+  exit 1
+fi
+licenses_directory="$resources_directory/licenses"
+if [[ -L "$licenses_directory" ]]; then
+  echo "Refusing to replace a licenses directory that is a symbolic link: $licenses_directory" >&2
+  exit 1
+fi
+if [[ -e "$licenses_directory" ]]; then
+  rm -rf "$licenses_directory"
+fi
+mkdir "$licenses_directory"
+
+cp "$project_root/LICENSE" "$licenses_directory/LICENSE"
+cp "$project_root/THIRD_PARTY_NOTICES.md" "$licenses_directory/THIRD_PARTY_NOTICES.md"
+
+dependency_labels=(
+  "PySide6-Essentials"
+  "opencv-python-headless"
+  "NumPy"
+  "imageio-ffmpeg/FFmpeg"
+)
+dependency_patterns=(
+  'pyside6[-_]essentials-*.dist-info'
+  'opencv[-_]python[-_]headless-*.dist-info'
+  'numpy-*.dist-info'
+  'imageio[-_]ffmpeg-*.dist-info'
+)
+matched_metadata_counts=(0 0 0 0)
+
+metadata_manifest="$(mktemp "${TMPDIR:-/tmp}/gemini-watermark-metadata.XXXXXX")"
+license_manifest=""
+cleanup_license_manifests() {
+  rm -f "$metadata_manifest"
+  if [[ -n "$license_manifest" ]]; then
+    rm -f "$license_manifest"
+  fi
+}
+trap cleanup_license_manifests EXIT
+license_manifest="$(mktemp "${TMPDIR:-/tmp}/gemini-watermark-license-files.XXXXXX")"
+if ! find "$site_packages" -mindepth 1 -maxdepth 1 -type d -iname '*.dist-info' -print0 > "$metadata_manifest"; then
+  echo "Could not inspect the installed Python site-packages directory: $site_packages" >&2
+  exit 1
+fi
+
+shopt -s nocasematch
+while IFS= read -r -d '' metadata_directory; do
+  metadata_name="${metadata_directory##*/}"
+  matching_dependency_index=-1
+  for ((dependency_index = 0; dependency_index < ${#dependency_patterns[@]}; dependency_index++)); do
+    case "$metadata_name" in
+      ${dependency_patterns[$dependency_index]})
+        matching_dependency_index=$dependency_index
+        break
+        ;;
+    esac
+  done
+  if ((matching_dependency_index < 0)); then
+    continue
+  fi
+
+  matched_metadata_counts[$matching_dependency_index]=$((matched_metadata_counts[$matching_dependency_index] + 1))
+  copied_license_count=0
+  if ! find "$metadata_directory" -type f -print0 > "$license_manifest"; then
+    echo "Could not inspect installed license metadata: $metadata_directory" >&2
+    exit 1
+  fi
+
+  while IFS= read -r -d '' candidate_file; do
+    relative_path="${candidate_file#"$metadata_directory"/}"
+    candidate_name="${relative_path##*/}"
+    is_license_file=0
+    case "$relative_path" in
+      license/*|licenses/*|*/license/*|*/licenses/*) is_license_file=1 ;;
+    esac
+    case "$candidate_name" in
+      *license*|*licence*|*copying*|*notice*|*author*|*copyright*|*patent*) is_license_file=1 ;;
+    esac
+    if ((is_license_file == 0)); then
+      continue
+    fi
+
+    destination_file="$licenses_directory/$metadata_name/$relative_path"
+    mkdir -p "${destination_file%/*}"
+    cp "$candidate_file" "$destination_file"
+    copied_license_count=$((copied_license_count + 1))
+  done < "$license_manifest"
+
+  if ((copied_license_count == 0)); then
+    echo "Warning: no license files were found in $metadata_name; continuing without them." >&2
+  fi
+done < "$metadata_manifest"
+shopt -u nocasematch
+
+for ((dependency_index = 0; dependency_index < ${#dependency_labels[@]}; dependency_index++)); do
+  if ((matched_metadata_counts[$dependency_index] == 0)); then
+    echo "Warning: no installed dist-info directory matched ${dependency_labels[$dependency_index]}; continuing without it." >&2
+  fi
+done
+
+cleanup_license_manifests
+trap - EXIT
+
 codesign --force --deep --sign - "$app_path"
 dmg_path="$project_root/dist/GeminiWatermarkEraser-macos-arm64.dmg"
 rm -f "$dmg_path"

@@ -22,6 +22,8 @@ uv run python -m gemini_watermark_eraser
 
 제미나이 로고를 확실히 찾지 못하면 영상은 변경하지 않고 해당 파일을 실패 처리합니다. 범용 워터마크 제거, 수동 마스크, 자르기, 색보정 등의 편집 기능은 포함하지 않습니다.
 
+워터마크가 덮은 원본 픽셀은 영상 파일에 남아 있지 않으므로, 앱은 앞뒤 프레임과 주변의 깨끗한 질감을 이용해 가려진 영역을 추정합니다. 움직임이 거의 없거나 고유한 물체가 완전히 가려진 장면에서는 픽셀 단위 원상복원을 보장할 수 없습니다.
+
 ## 테스트
 
 ```powershell
@@ -41,6 +43,10 @@ Apple Silicon macOS 앱은 GitHub Actions의 **Build desktop apps** 워크플로
 ```bash
 bash packaging/build_macos.sh
 ```
+
+## 공개 Windows 배포본 테스트
+
+GitHub의 [Releases](https://github.com/kge-lab/watermark_eraser/releases)에서 `release-0.1.1`의 `GeminiWatermarkEraser-windows-x64.zip`을 내려받아 새 폴더에 압축을 풉니다. `GeminiWatermarkEraser.exe`를 실행하고 원본 영상의 복사본을 추가한 뒤 **워터마크 제거**를 누르면 같은 폴더에 `_clean.mp4` 결과가 생성됩니다. 서명하지 않은 개인용 앱이라 Windows SmartScreen이 표시되면 파일 출처와 릴리스의 SHA-256을 확인한 뒤 **추가 정보 → 실행**을 선택합니다.
 
 ## macOS 개인용 앱 실행
 
