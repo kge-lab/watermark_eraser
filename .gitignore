@@ -9,4 +9,5 @@ dist/
 deployment/
 *.egg-info/
 *.partial.mp4
+sample/*_clean.mp4
 nuitka-crash-report.xml

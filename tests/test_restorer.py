@@ -66,3 +66,26 @@ def test_mask_is_soft_and_does_not_fill_bounding_box_corners() -> None:
     assert mask[32, 32] > 0.95
     assert mask[0, 0] < 0.01
     assert mask[:, 32].max() > 0.95
+
+
+def test_fallback_keeps_visible_texture_under_translucent_logo() -> None:
+    width, height, size = 320, 180, 24
+    x, y = 270, 135
+    detection = LogoDetection(x, y, size, size, _star_mask(size), 1.0)
+    restorer = TemporalLogoRestorer(width, height, detection)
+    yy, xx = np.mgrid[:height, :width]
+    clean = np.stack(
+        [
+            ((xx * 9 + yy * 3) % 255),
+            ((xx * 5 + yy * 11) % 255),
+            ((xx * 13 + yy * 7) % 255),
+        ],
+        axis=2,
+    ).astype(np.uint8)
+    marked = _watermarked(clean, detection)
+    roi = restorer.extract(marked)
+    base = restorer._fallback(roi)
+    detailed = restorer._restore_visible_detail(roi, base)
+    interior = cv2.erode(restorer.hard_mask, np.ones((5, 5), np.uint8)) > 0
+    change = np.mean(np.abs(detailed.astype(np.float32) - base.astype(np.float32))[interior])
+    assert change > 0.1

@@ -163,6 +163,18 @@ class TemporalLogoRestorer:
         inner = cv2.GaussianBlur(inner, (0, 0), sigmaX=1.2)[..., None]
         return np.clip(first * (1.0 - inner) + smooth * inner, 0, 255).astype(np.uint8)
 
+    def _restore_visible_detail(self, current: np.ndarray, restored: np.ndarray) -> np.ndarray:
+        """Keep fine source texture that remains visible beneath the translucent mark."""
+        interior = cv2.erode(self.hard_mask, np.ones((5, 5), np.uint8))
+        if not np.any(interior):
+            return restored
+        source = current.astype(np.float32)
+        low_frequency = cv2.GaussianBlur(source, (0, 0), sigmaX=1.15)
+        detail = np.clip(source - low_frequency, -18.0, 18.0)
+        alpha = cv2.GaussianBlur(interior.astype(np.float32) / 255.0, (0, 0), sigmaX=1.0)
+        alpha = (alpha * 0.48)[..., None]
+        return np.clip(restored.astype(np.float32) + detail * alpha, 0, 255).astype(np.uint8)
+
     def _exemplar_fill(self, current: np.ndarray) -> np.ndarray | None:
         template = current[
             self._template_y0 : self._template_y1,
@@ -238,7 +250,7 @@ class TemporalLogoRestorer:
     def _fuse(self, current: np.ndarray, candidates: list[_WarpedCandidate]) -> np.ndarray:
         if not candidates:
             self.last_temporal_coverage = 0.0
-            return self._fallback(current)
+            return self._restore_visible_detail(current, self._fallback(current))
 
         values = np.stack([candidate.pixels[self._mask_y, self._mask_x] for candidate in candidates], axis=0)
         valid = np.stack([candidate.valid[self._mask_y, self._mask_x] for candidate in candidates], axis=0)
@@ -280,7 +292,7 @@ class TemporalLogoRestorer:
         fused = np.clip(fused + detail * detail_strength * 0.70, 0, 255)
         result = fallback.astype(np.float32)
         result[self._mask_y[accepted], self._mask_x[accepted]] = fused[accepted]
-        return np.clip(result, 0, 255).astype(np.uint8)
+        return self._restore_visible_detail(current, np.clip(result, 0, 255).astype(np.uint8))
 
     def restore(
         self,
