@@ -170,10 +170,14 @@ class TemporalLogoRestorer:
             return restored
         source = current.astype(np.float32)
         low_frequency = cv2.GaussianBlur(source, (0, 0), sigmaX=1.15)
-        detail = np.clip(source - low_frequency, -18.0, 18.0)
+        detail = np.clip(source - low_frequency, -24.0, 24.0)
+        repaired_low = cv2.GaussianBlur(restored.astype(np.float32), (0, 0), sigmaX=0.85)
+        repaired_detail = np.clip(restored.astype(np.float32) - repaired_low, -18.0, 18.0)
         alpha = cv2.GaussianBlur(interior.astype(np.float32) / 255.0, (0, 0), sigmaX=1.0)
-        alpha = (alpha * 0.48)[..., None]
-        return np.clip(restored.astype(np.float32) + detail * alpha, 0, 255).astype(np.uint8)
+        alpha = (alpha * 0.72)[..., None]
+        return np.clip(restored.astype(np.float32) + detail * alpha + repaired_detail * alpha * 0.70, 0, 255).astype(
+            np.uint8
+        )
 
     def _exemplar_fill(self, current: np.ndarray) -> np.ndarray | None:
         template = current[
@@ -218,7 +222,15 @@ class TemporalLogoRestorer:
         best_score, _, source_x, source_y = ranked_candidates[0]
         if best_score > 0.36:
             return None
-        selected = [item for item in ranked_candidates if item[0] <= best_score + 0.045][:5]
+        cluster_radius = max(3.0, min(float(self.detection.width) * 0.12, 8.0))
+        selected = [
+            item
+            for item in ranked_candidates
+            if item[0] <= best_score + 0.045
+            and np.hypot(item[2] - source_x, item[3] - source_y) <= cluster_radius
+        ][:5]
+        if not selected:
+            selected = [ranked_candidates[0]]
         patches = np.stack(
             [
                 current[y : y + template.shape[0], x : x + template.shape[1]].astype(np.float32)
