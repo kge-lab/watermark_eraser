@@ -7,9 +7,14 @@ import warnings
 import cv2
 import numpy as np
 
+from .alpha_profiles import alpha_profile_candidates
+from .dynamic_alpha import DynamicAlphaConfig, DynamicAlphaState, restore_dynamic_alpha
 from .models import LogoDetection
 
 TEMPORAL_OFFSETS = (4, 12, 24, 48, 72)
+# If a clip offers no safe dynamic-alpha frame in roughly its first four
+# seconds at the common 24 fps, keep the cheaper legacy path for the rest.
+DYNAMIC_INITIAL_TRIAL_FRAMES = 96
 
 
 @dataclass(slots=True)
@@ -116,6 +121,56 @@ class TemporalLogoRestorer:
         self._exemplar_local_fill = local_fill
         self._exemplar_ring = cv2.dilate(local_hard, np.ones((ring_width, ring_width), np.uint8)) - local_hard
 
+        # Dynamic reverse-alpha recovery is deliberately optional.  It is
+        # enabled only for a calibrated resolution and a confident detector;
+        # every rejected frame remains byte-for-byte on the legacy temporal
+        # restoration path.
+        profiles = (
+            alpha_profile_candidates(
+                self.roi_shape,
+                roi_x0=self.roi_x0,
+                roi_y0=self.roi_y0,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                detection=detection,
+            )
+            if detection.confidence >= 0.35
+            else ()
+        )
+        self._dynamic_profile = profiles[0] if profiles else None
+        self._dynamic_state = DynamicAlphaState()
+        self._dynamic_config = DynamicAlphaConfig(
+            default_scale=0.92,
+            minimum_scale=0.85,
+            maximum_scale=1.10,
+            maximum_scale_step=0.05,
+            minimum_profile_value=0.02,
+            maximum_reference_worsened_fraction=0.45,
+            maximum_reference_tail_ratio=1.20,
+        )
+        self._dynamic_reference_confidence: np.ndarray | None = None
+        self._dynamic_detail_weight: np.ndarray | None = None
+        self._dynamic_bounds: tuple[int, int, int, int] | None = None
+        self._dynamic_disabled = False
+        if self._dynamic_profile is not None:
+            profile_support = (self._dynamic_profile > 0.055).astype(np.uint8)
+            distance = cv2.distanceTransform(profile_support, cv2.DIST_L2, 5)
+            self._dynamic_reference_confidence = (
+                (distance >= 2.2) & (self._dynamic_profile > 0.07)
+            ).astype(np.float32)
+            inner_weight = np.clip((distance - 1.8) / 2.6, 0.0, 1.0)
+            opacity_weight = np.clip((self._dynamic_profile - 0.06) / 0.12, 0.0, 1.0)
+            self._dynamic_detail_weight = (inner_weight * opacity_weight * 0.65).astype(np.float32)
+            profile_y, profile_x = np.nonzero(self._dynamic_profile > 0.0)
+            if len(profile_y) > 0:
+                crop_pad = 6
+                self._dynamic_bounds = (
+                    max(0, int(profile_y.min()) - crop_pad),
+                    min(roi_height, int(profile_y.max()) + crop_pad + 1),
+                    max(0, int(profile_x.min()) - crop_pad),
+                    min(roi_width, int(profile_x.max()) + crop_pad + 1),
+                )
+
     @property
     def temporal_radius(self) -> int:
         return TEMPORAL_OFFSETS[-1]
@@ -196,6 +251,122 @@ class TemporalLogoRestorer:
             0,
             255,
         ).astype(np.uint8)
+
+    def _enhance_with_dynamic_alpha(self, current: np.ndarray, baseline: np.ndarray) -> np.ndarray:
+        """Recover safe interior texture without exposing the logo boundary.
+
+        A full reverse-alpha result is too sensitive to tiny profile or codec
+        mismatches and can create a dark star-shaped hole.  Use it only as a
+        source of bounded high-frequency detail, while the proven temporal /
+        exemplar result keeps all low-frequency colour and boundary pixels.
+        """
+        profile = self._dynamic_profile
+        confidence = self._dynamic_reference_confidence
+        detail_weight = self._dynamic_detail_weight
+        bounds = self._dynamic_bounds
+        if (
+            self._dynamic_disabled
+            or profile is None
+            or confidence is None
+            or detail_weight is None
+            or bounds is None
+        ):
+            return baseline
+
+        y0, y1, x0, x1 = bounds
+        current_crop = current[y0:y1, x0:x1]
+        baseline_crop = baseline[y0:y1, x0:x1]
+        profile_crop = profile[y0:y1, x0:x1]
+        confidence_crop = confidence[y0:y1, x0:x1]
+        detail_weight_crop = detail_weight[y0:y1, x0:x1]
+
+        def reject(scale: float | None = None) -> np.ndarray:
+            rejection_scale = (
+                scale
+                if scale is not None
+                else self._dynamic_state.last_scale
+                if self._dynamic_state.last_scale is not None
+                else self._dynamic_config.default_scale
+            )
+            self._dynamic_state.record(float(rejection_scale), accepted=False)
+            if (
+                self._dynamic_state.accepted_frames == 0
+                and self._dynamic_state.rejected_frames >= DYNAMIC_INITIAL_TRIAL_FRAMES
+            ):
+                self._dynamic_disabled = True
+            return baseline
+
+        trial_state = DynamicAlphaState(last_scale=self._dynamic_state.last_scale)
+        try:
+            result = restore_dynamic_alpha(
+                current_crop,
+                np.asarray((245.0, 250.0, 255.0), dtype=np.float32),
+                profile_crop,
+                clean_reference=baseline_crop,
+                reference_confidence=confidence_crop,
+                state=trial_state,
+                config=self._dynamic_config,
+            )
+        except (ValueError, FloatingPointError, cv2.error):
+            return reject()
+        scale_was_clamped = not np.isclose(
+            result.selection.raw_scale,
+            result.selection.bounded_scale,
+            rtol=0.0,
+            atol=1e-6,
+        )
+        if scale_was_clamped:
+            return reject(result.selection.scale)
+        if not result.quality.accepted:
+            return reject(result.selection.scale)
+
+        candidate = result.candidate.astype(np.float32)
+        baseline_float = baseline_crop.astype(np.float32)
+        candidate_highpass = candidate - cv2.GaussianBlur(candidate, (0, 0), sigmaX=0.9)
+        baseline_highpass = baseline_float - cv2.GaussianBlur(baseline_float, (0, 0), sigmaX=0.9)
+        detail_delta = np.clip(candidate_highpass - baseline_highpass, -8.0, 8.0)
+        quality_gain = float(np.clip(result.quality.score / 0.55, 0.0, 1.0))
+        enhanced = baseline_float + detail_delta * (detail_weight_crop * quality_gain)[..., None]
+        if not np.all(np.isfinite(enhanced)):
+            return reject(result.selection.scale)
+        enhanced_uint8 = np.rint(np.clip(enhanced, 0.0, 255.0)).astype(np.uint8)
+        active = detail_weight_crop > 0.0
+        delta = enhanced_uint8.astype(np.float32) - baseline_float
+        if np.any(np.abs(np.mean(delta[active], axis=0)) > 0.35):
+            return reject(result.selection.scale)
+        newly_clipped = np.any(
+            ((enhanced_uint8 <= 0) | (enhanced_uint8 >= 255))
+            & ((baseline_crop > 0) & (baseline_crop < 255)),
+            axis=2,
+        )
+        if float(np.mean(newly_clipped[active])) > 0.001:
+            return reject(result.selection.scale)
+
+        baseline_gray = cv2.cvtColor(baseline_crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        enhanced_gray = cv2.cvtColor(enhanced_uint8, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        baseline_detail = baseline_gray - cv2.GaussianBlur(baseline_gray, (0, 0), sigmaX=0.9)
+        enhanced_detail = enhanced_gray - cv2.GaussianBlur(enhanced_gray, (0, 0), sigmaX=0.9)
+        baseline_energy = max(float(np.mean(np.abs(baseline_detail[active]))), 0.25)
+        detail_ratio = float(np.mean(np.abs(enhanced_detail[active]))) / baseline_energy
+        baseline_horizontal = cv2.Sobel(baseline_gray, cv2.CV_32F, 1, 0, ksize=3)
+        baseline_vertical = cv2.Sobel(baseline_gray, cv2.CV_32F, 0, 1, ksize=3)
+        enhanced_horizontal = cv2.Sobel(enhanced_gray, cv2.CV_32F, 1, 0, ksize=3)
+        enhanced_vertical = cv2.Sobel(enhanced_gray, cv2.CV_32F, 0, 1, ksize=3)
+        baseline_sobel = max(
+            float(np.mean(cv2.magnitude(baseline_horizontal, baseline_vertical)[active])),
+            0.5,
+        )
+        sobel_ratio = float(
+            np.mean(cv2.magnitude(enhanced_horizontal, enhanced_vertical)[active])
+        ) / baseline_sobel
+        detail_improved = detail_ratio >= 1.002 and sobel_ratio >= 0.98
+        if not detail_improved or detail_ratio > 1.25 or sobel_ratio > 1.25:
+            return reject(result.selection.scale)
+
+        self._dynamic_state.record(result.selection.scale, accepted=True)
+        output = baseline.copy()
+        output[y0:y1, x0:x1] = enhanced_uint8
+        return output
 
     @staticmethod
     def _gradient_structure(image: np.ndarray, mask: np.ndarray) -> tuple[float, float]:
@@ -461,7 +632,8 @@ class TemporalLogoRestorer:
             fallback.astype(np.float32) * fallback_weight[..., None]
             + temporal.astype(np.float32) * temporal_weight[..., None]
         )
-        return self._composite_repair(current, np.clip(replacement, 0, 255).astype(np.uint8))
+        baseline = self._composite_repair(current, np.clip(replacement, 0, 255).astype(np.uint8))
+        return self._enhance_with_dynamic_alpha(current, baseline)
 
     def _fuse(self, current: np.ndarray, candidates: list[_WarpedCandidate]) -> np.ndarray:
         if not candidates:

@@ -316,3 +316,92 @@ def test_structured_roof_fallback_preserves_detail_and_temporal_stability() -> N
 
     assert float(np.mean(preference_flip_excesses)) <= 2.0
     assert float(np.percentile(preference_flip_excesses, 95)) <= 2.5
+
+
+def test_dynamic_alpha_adds_only_safe_interior_texture() -> None:
+    width, height, size = 1280, 720, 65
+    detection = LogoDetection(1127, 567, size, size, _star_mask(size), 0.95)
+    restorer = TemporalLogoRestorer(width, height, detection)
+    assert restorer._dynamic_profile is not None
+    assert restorer._dynamic_detail_weight is not None
+
+    roi_height, roi_width = restorer.roi_shape
+    yy, xx = np.mgrid[:roi_height, :roi_width]
+    texture = (
+        104.0
+        + 23.0 * np.sin(xx * 0.58)
+        + 18.0 * np.cos(yy * 0.47)
+        + 12.0 * np.sin((xx + yy) * 0.91)
+    )
+    clean = np.stack((texture * 0.83, texture, texture * 1.11), axis=2)
+    clean = np.clip(clean, 0.0, 255.0).astype(np.uint8)
+    baseline = cv2.GaussianBlur(clean, (0, 0), sigmaX=1.15)
+    alpha = (restorer._dynamic_profile * 0.94)[..., None]
+    watermark = np.asarray((245.0, 250.0, 255.0), dtype=np.float32)
+    marked = np.clip(clean.astype(np.float32) * (1.0 - alpha) + watermark * alpha, 0, 255).astype(
+        np.uint8
+    )
+
+    enhanced = restorer._enhance_with_dynamic_alpha(marked, baseline)
+    active = restorer._dynamic_detail_weight > 0.0
+    outside = ~active
+    assert restorer._dynamic_state.accepted_frames == 1
+    assert np.array_equal(enhanced[outside], baseline[outside])
+
+    baseline_error = np.mean(np.abs(baseline.astype(np.float32) - clean.astype(np.float32))[active])
+    enhanced_error = np.mean(np.abs(enhanced.astype(np.float32) - clean.astype(np.float32))[active])
+    assert enhanced_error < baseline_error
+    active_bias = np.mean(enhanced.astype(np.float32) - baseline.astype(np.float32), axis=2)[active]
+    assert abs(float(np.mean(active_bias))) <= 0.1
+
+    edge = cv2.dilate(active.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    edge &= ~cv2.erode(active.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    signed_edge_error = np.mean(enhanced.astype(np.float32) - baseline.astype(np.float32), axis=2)[edge]
+    assert abs(float(np.mean(signed_edge_error))) <= 1.0
+    assert float(np.percentile(np.abs(signed_edge_error), 95)) <= 4.0
+
+    # If the baseline already contains the recoverable texture, the post-gate
+    # must reject a no-op deblend instead of adding codec-scale noise.
+    pristine_restorer = TemporalLogoRestorer(width, height, detection)
+    pristine = pristine_restorer._enhance_with_dynamic_alpha(marked, clean)
+    assert np.array_equal(pristine, clean)
+    assert pristine_restorer._dynamic_state.last_scale is None
+    assert pristine_restorer._dynamic_state.rejected_frames == 1
+
+    # A scale estimate outside the calibrated range must be rejected instead
+    # of being silently pinned to a bound and treated as trustworthy.
+    overdriven_restorer = TemporalLogoRestorer(width, height, detection)
+    overdriven_alpha = (overdriven_restorer._dynamic_profile * 1.18)[..., None]
+    overdriven_marked = np.clip(
+        clean.astype(np.float32) * (1.0 - overdriven_alpha) + watermark * overdriven_alpha,
+        0,
+        255,
+    ).astype(np.uint8)
+    rejected = overdriven_restorer._enhance_with_dynamic_alpha(overdriven_marked, baseline)
+    assert np.array_equal(rejected, baseline)
+    assert overdriven_restorer._dynamic_state.last_scale is None
+    assert overdriven_restorer._dynamic_state.rejected_frames == 1
+
+
+def test_dynamic_alpha_rejection_preserves_legacy_result_exactly() -> None:
+    width, height, size = 1280, 720, 65
+    detection = LogoDetection(1127, 567, size, size, _star_mask(size), 0.95)
+    restorer = TemporalLogoRestorer(width, height, detection)
+    baseline = np.full((*restorer.roi_shape, 3), (72, 104, 136), dtype=np.uint8)
+
+    enhanced = restorer._enhance_with_dynamic_alpha(baseline, baseline)
+
+    assert np.array_equal(enhanced, baseline)
+    assert restorer._dynamic_state.accepted_frames == 0
+    assert restorer._dynamic_state.rejected_frames == 1
+
+
+def test_dynamic_alpha_is_disabled_for_weak_detection() -> None:
+    width, height, size = 1280, 720, 65
+    detection = LogoDetection(1127, 567, size, size, _star_mask(size), 0.34)
+    restorer = TemporalLogoRestorer(width, height, detection)
+    assert restorer._dynamic_profile is None
+
+    current = np.full((*restorer.roi_shape, 3), 210, dtype=np.uint8)
+    baseline = np.full_like(current, 90)
+    assert np.array_equal(restorer._enhance_with_dynamic_alpha(current, baseline), baseline)

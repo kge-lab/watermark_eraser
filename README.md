@@ -24,6 +24,8 @@ uv run python -m gemini_watermark_eraser
 
 워터마크가 덮은 원본 픽셀은 영상 파일에 남아 있지 않으므로, 앱은 앞뒤 프레임과 주변의 깨끗한 질감을 이용해 가려진 영역을 추정합니다. 움직임이 거의 없거나 고유한 물체가 완전히 가려진 장면에서는 픽셀 단위 원상복원을 보장할 수 없습니다.
 
+지원되는 제미나이 프로필에서는 보정된 알파 맵으로 로고 아래의 미세 질감을 역산합니다. 전체 역산 결과를 그대로 쓰면 어두운 별 모양 윤곽이 생길 수 있으므로, 앱은 로고 경계를 제외한 내부 디테일만 제한적으로 결합합니다. 밝기 편향·클리핑·선명도 검사를 통과하지 못한 프레임은 기존 시간축 복원 결과를 그대로 사용합니다.
+
 ## 테스트
 
 ```powershell
@@ -46,7 +48,7 @@ bash packaging/build_macos.sh
 
 ## 공개 Windows 배포본 테스트
 
-GitHub의 [Releases](https://github.com/kge-lab/watermark_eraser/releases)에서 `release-0.1.1`의 `GeminiWatermarkEraser-windows-x64.zip`을 내려받아 새 폴더에 압축을 풉니다. `GeminiWatermarkEraser.exe`를 실행하고 원본 영상의 복사본을 추가한 뒤 **워터마크 제거**를 누르면 같은 폴더에 `_clean.mp4` 결과가 생성됩니다. 서명하지 않은 개인용 앱이라 Windows SmartScreen이 표시되면 파일 출처와 릴리스의 SHA-256을 확인한 뒤 **추가 정보 → 실행**을 선택합니다.
+GitHub의 [Releases](https://github.com/kge-lab/watermark_eraser/releases)에서 `release-0.1.2`의 `GeminiWatermarkEraser-windows-x64.zip`을 내려받아 새 폴더에 압축을 풉니다. `GeminiWatermarkEraser.exe`를 실행하고 원본 영상의 복사본을 추가한 뒤 **워터마크 제거**를 누르면 같은 폴더에 `_clean.mp4` 결과가 생성됩니다. 서명하지 않은 개인용 앱이라 Windows SmartScreen이 표시되면 파일 출처와 릴리스의 SHA-256을 확인한 뒤 **추가 정보 → 실행**을 선택합니다.
 
 ## macOS 개인용 앱 실행
 
