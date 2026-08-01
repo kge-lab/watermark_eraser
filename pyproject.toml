@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gemini-watermark-eraser"
+version = "0.1.0"
+description = "Offline desktop utility that removes the visible Gemini watermark from generated videos."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+dependencies = [
+  "imageio-ffmpeg>=0.6.0,<0.7",
+  "numpy>=2.0,<3",
+  "opencv-python-headless>=4.10,<5",
+  "PySide6-Essentials>=6.8,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+]
+build = [
+  "nuitka>=2.7,<4",
+  "ordered-set>=4.1,<5",
+  "zstandard>=0.23,<1",
+]
+
+[project.gui-scripts]
+gemini-watermark-eraser = "gemini_watermark_eraser.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gemini_watermark_eraser"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
