@@ -8,6 +8,16 @@ if ($LASTEXITCODE -ne 0) {
     throw "uv sync failed with exit code $LASTEXITCODE."
 }
 
+$distDirectory = Join-Path $projectRoot "dist"
+if (Test-Path -LiteralPath $distDirectory -PathType Container) {
+    foreach ($existingApplicationDirectory in (Get-ChildItem -LiteralPath $distDirectory -Directory -Filter "GeminiWatermarkEraser*.dist")) {
+        if (($existingApplicationDirectory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Refusing to remove a standalone application directory that is a reparse point: $($existingApplicationDirectory.FullName)"
+        }
+        Remove-Item -LiteralPath $existingApplicationDirectory.FullName -Recurse -Force
+    }
+}
+
 $deploySpecPath = Join-Path $projectRoot "packaging\pysidedeploy.windows.spec"
 $deploySpecBytes = [IO.File]::ReadAllBytes($deploySpecPath)
 $deployExitCode = 1
@@ -23,7 +33,6 @@ if ($deployExitCode -ne 0) {
     throw "Windows application build failed with exit code $deployExitCode."
 }
 
-$distDirectory = Join-Path $projectRoot "dist"
 $applicationDirectory = Get-ChildItem -LiteralPath $distDirectory -Directory -Filter "*.dist" | Select-Object -First 1
 if ($null -eq $applicationDirectory) {
     throw "Windows standalone application directory was not produced."

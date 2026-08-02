@@ -23,7 +23,7 @@ the complete configure/build feature list and identifies FFmpeg commit
 Corresponding FFmpeg source is available from both locations below:
 
 - same release server as this application binary:
-  <https://github.com/kge-lab/watermark_eraser/releases/download/release-0.1.1/ffmpeg-7.1-b08d7969c5-source.tar.gz>
+  <https://github.com/kge-lab/watermark_eraser/releases/download/release-0.1.2/ffmpeg-7.1-b08d7969c5-source.tar.gz>
   (SHA-256: `02FA6D9827DA3B6786E4DF821218CC036DB2B4481E7F48267C2DCDA695633AFC`)
 - canonical upstream commit:
   <https://github.com/FFmpeg/FFmpeg/commit/b08d7969c5>
